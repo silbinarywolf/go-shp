@@ -2,8 +2,10 @@ package shp
 
 import (
 	"archive/zip"
+	"bytes"
 	"fmt"
 	"io"
+	"io/ioutil"
 	"path"
 	"strings"
 )
@@ -11,16 +13,18 @@ import (
 // ZipReader provides an interface for reading Shapefiles that are compressed in a ZIP archive.
 type ZipReader struct {
 	sr SequentialReader
-	z  *zip.ReadCloser
+	z  *zip.Reader
+
+	// file is only set if OpenZip from file
+	file *zip.ReadCloser
 }
 
 // openFromZIP is convenience function for opening the file called name that is
 // compressed in z for reading.
-func openFromZIP(z *zip.ReadCloser, name string) (io.ReadCloser, error) {
+func openFromZIP(z *zip.Reader, name string) (io.ReadCloser, error) {
 	for _, f := range z.File {
 		if f.Name == name {
 			return f.Open()
-
 		}
 	}
 	return nil, fmt.Errorf("No such file in archive: %s", name)
@@ -33,25 +37,53 @@ func OpenZip(zipFilePath string) (*ZipReader, error) {
 		return nil, err
 	}
 	zr := &ZipReader{
+		z:    &z.Reader,
+		file: z,
+	}
+	if err := zr.loadSHPAndMaybeDBF(); err != nil {
+		return nil, err
+	}
+	return zr, nil
+}
+
+// OpenZipReader opens a ZIP file that contains a single shapefile from a stream
+func OpenZipReader(zipFileStream io.Reader) (*ZipReader, error) {
+	byteData, err := ioutil.ReadAll(zipFileStream)
+	if err != nil {
+		return nil, err
+	}
+	buf := bytes.NewReader(byteData)
+	z, err := zip.NewReader(buf, int64(buf.Len()))
+	if err != nil {
+		return nil, err
+	}
+	zr := &ZipReader{
 		z: z,
 	}
-	shapeFiles := shapesInZip(z)
+	if err := zr.loadSHPAndMaybeDBF(); err != nil {
+		return nil, err
+	}
+	return zr, nil
+}
+
+func (zr *ZipReader) loadSHPAndMaybeDBF() error {
+	shapeFiles := shapesInZip(zr.z)
 	if len(shapeFiles) == 0 {
-		return nil, fmt.Errorf("archive does not contain a .shp file")
+		return fmt.Errorf("archive does not contain a .shp file")
 	}
 	if len(shapeFiles) > 1 {
-		return nil, fmt.Errorf("archive does contain multiple .shp files")
+		return fmt.Errorf("archive does contain multiple .shp files")
 	}
 
 	shp, err := openFromZIP(zr.z, shapeFiles[0].Name)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	withoutExt := strings.TrimSuffix(shapeFiles[0].Name, ".shp")
 	// dbf is optional, so no error checking here
 	dbf, _ := openFromZIP(zr.z, withoutExt+".dbf")
 	zr.sr = SequentialReaderFromExt(shp, dbf)
-	return zr, nil
+	return nil
 }
 
 // ShapesInZip returns a string-slice with the names (i.e. relatives paths in
@@ -62,14 +94,14 @@ func ShapesInZip(zipFilePath string) ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
-	shapeFiles := shapesInZip(z)
+	shapeFiles := shapesInZip(&z.Reader)
 	for i := range shapeFiles {
 		names = append(names, shapeFiles[i].Name)
 	}
 	return names, nil
 }
 
-func shapesInZip(z *zip.ReadCloser) []*zip.File {
+func shapesInZip(z *zip.Reader) []*zip.File {
 	var shapeFiles []*zip.File
 	for _, f := range z.File {
 		if strings.HasSuffix(f.Name, ".shp") {
@@ -91,7 +123,8 @@ func OpenShapeFromZip(zipFilePath string, name string) (*ZipReader, error) {
 		return nil, err
 	}
 	zr := &ZipReader{
-		z: z,
+		z:    &z.Reader,
+		file: z,
 	}
 
 	shp, err := openFromZIP(zr.z, name)
@@ -112,9 +145,10 @@ func (zr *ZipReader) Close() error {
 	if err != nil {
 		s += err.Error() + ". "
 	}
-	err = zr.z.Close()
-	if err != nil {
-		s += err.Error() + ". "
+	if zr.file != nil {
+		if err := zr.file.Close(); err != nil {
+			s += err.Error() + ". "
+		}
 	}
 	if s != "" {
 		return fmt.Errorf(s)
